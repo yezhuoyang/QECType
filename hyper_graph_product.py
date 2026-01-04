@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Iterable
+from typing import List, Dict, Tuple, Iterable, Union
 
 
 # ============================================================
@@ -83,107 +83,6 @@ def css_from_chain(chain: ChainComplex):
 
 
 # ============================================================
-#  GF(2) utilities + stabilizer IR export
-# ============================================================
-
-def gf2_rank(M: np.ndarray) -> int:
-    """
-    Compute rank of a binary matrix M over GF(2) via Gaussian elimination.
-    """
-    M = (M.copy() % 2).astype(np.int8)
-    n_rows, n_cols = M.shape
-    rank = 0
-    pivot_col = 0
-
-    for r in range(n_rows):
-        # Find pivot in or after pivot_col
-        while pivot_col < n_cols:
-            pivot_row = None
-            for i in range(r, n_rows):
-                if M[i, pivot_col] == 1:
-                    pivot_row = i
-                    break
-            if pivot_row is None:
-                pivot_col += 1
-            else:
-                break
-
-        if pivot_col >= n_cols:
-            break
-
-        # Swap pivot row into position r
-        if pivot_row != r:
-            M[[r, pivot_row], :] = M[[pivot_row, r], :]
-
-        # Eliminate this column in all other rows
-        for i in range(n_rows):
-            if i != r and M[i, pivot_col] == 1:
-                M[i, :] ^= M[r, :]
-
-        rank += 1
-        pivot_col += 1
-
-    return rank
-
-
-def chain_to_stabilizer_ir(
-    chain: ChainComplex,
-    code_distance: int,
-    code_type: str = "Standard",
-    reg_name: str = "q2",
-) -> str:
-    """
-    Convert a CSS code given as a ChainComplex into a stabilizer IR string:
-
-        [[n,k,d,'Type']] q2 {
-            IIIXXXX;
-            IXXIIXX;
-            ...
-        }
-
-    Assumes:
-        - Qubits live on C1.
-        - X stabilizers are rows of Hx (from faces / C2).
-        - Z stabilizers are rows of Hz (from vertices / C0).
-    """
-    Hx, Hz, _ = css_from_chain(chain)
-
-    n = chain.dim_C1  # number of physical qubits
-
-    # Correct stabilizer rank for CSS:
-    # S = [[Hx | 0],
-    #      [0  | Hz]]
-    # so rank(S) = rank(Hx) + rank(Hz).
-    rank_Hx = gf2_rank(Hx) if Hx.size else 0
-    rank_Hz = gf2_rank(Hz) if Hz.size else 0
-    r = rank_Hx + rank_Hz
-
-    k = n - r  # #logical qubits
-
-    def pauli_string_from_row(row: np.ndarray, p: str) -> str:
-        # row is length-n binary vector; p is 'X' or 'Z'
-        return "".join(p if bit else "I" for bit in row)
-
-    lines: List[str] = []
-
-    # X-stabilizers first (faces)
-    for i in range(Hx.shape[0]):
-        row = Hx[i, :]
-        lines.append(pauli_string_from_row(row, "X") + ";")
-
-    # Z-stabilizers (vertices)
-    for i in range(Hz.shape[0]):
-        row = Hz[i, :]
-        lines.append(pauli_string_from_row(row, "Z") + ";")
-
-    header = f"[[{n},{k},{code_distance},'{code_type}']] {reg_name} {{"
-    body = "\n".join("    " + s for s in lines)
-    footer = "}"
-
-    return header + "\n" + body + "\n" + footer
-
-
-# ============================================================
 #  AST: expressions
 # ============================================================
 
@@ -229,7 +128,7 @@ def eval_expr(expr: Expr, env: Dict[str, int]) -> int:
 
 
 # ============================================================
-#  AST: cells, ranges, boundary rules
+#  AST: cells, ranges, boundary rules, code defs, combinators
 # ============================================================
 
 @dataclass
@@ -288,14 +187,43 @@ class BoundaryRule:
 @dataclass
 class CodeDef:
     """
-    Top-level code definition:
+    Primitive chain complex definition:
 
-        code toric_square_lattice(d: Int) as ChainComplex over Z2 { ... }
+        code X(d: Int) as ChainComplex over Z2 { cells {...} boundary {...} }
     """
     name: str
     param_names: List[str]
     cell_families: List[CellFamilyDecl]
     boundary_rules: List[BoundaryRule]
+
+
+@dataclass
+class CodeCall:
+    """
+    A reference to another code with actual parameters:
+
+        repetition(d)
+        repetition(d-1)
+    """
+    name: str
+    arg_exprs: List[Expr]
+
+
+@dataclass
+class HypergraphProductDef:
+    """
+    Code defined by hypergraph product of two other codes:
+
+        code rep_hgp(d: Int) as ChainComplex over Z2 =
+          hypergraph_product(repetition(d), repetition(d));
+    """
+    name: str
+    param_names: List[str]
+    left: CodeCall
+    right: CodeCall
+
+
+CodeLike = Union[CodeDef, HypergraphProductDef]
 
 
 # ============================================================
@@ -333,11 +261,13 @@ def iterate_family_indices(
 
 def compile_chain_complex(code: CodeDef, param_values: Dict[str, int]) -> ChainComplex:
     """
-    Compile a CodeDef (AST) and concrete parameter values into a ChainComplex.
+    Compile a primitive CodeDef (cells + boundary) and concrete parameter values
+    into a ChainComplex.
 
     This version assumes *periodic* (toric) behavior for index arithmetic:
     whenever a boundary rule produces an index outside the range [0, upper),
-    we wrap it modulo 'upper'.
+    we wrap it modulo 'upper'. For open chains (repetition), nothing goes
+    out-of-bounds so wrapping is a no-op.
     """
     # 1. Parameter environment
     env_params = dict(param_values)
@@ -483,6 +413,133 @@ def compile_chain_complex(code: CodeDef, param_values: Dict[str, int]) -> ChainC
 
 
 # ============================================================
+#  Hypergraph product combinator (backend)
+# ============================================================
+
+def hypergraph_product(A: ChainComplex, B: ChainComplex) -> ChainComplex:
+    """
+    Hypergraph product of two *classical* chain complexes A, B that each
+    have a single nontrivial differential d1: C1 -> C0.
+
+    We use the standard chain-complex-level construction:
+
+      D2 = C1^A ⊗ C1^B
+      D1 = (C1^A ⊗ C0^B) ⊕ (C0^A ⊗ C1^B)
+      D0 = C0^A ⊗ C0^B
+
+    with differentials (over F2):
+
+      ∂2(eA ⊗ eB) = (eA ⊗ ∂b(eB)) ⊕ (∂a(eA) ⊗ eB)
+      ∂1(eA ⊗ vB, vA ⊗ eB) = ∂a(eA) ⊗ vB + vA ⊗ ∂b(eB)
+
+    This yields a 2D ChainComplex representing the CSS hypergraph product code.
+    """
+    H1 = A.d1  # shape (m1a, n1a)
+    H2 = B.d1  # shape (m1b, n1b)
+    m1a, n1a = H1.shape
+    m1b, n1b = H2.shape
+
+    # Dimensions
+    dim_C2 = n1a * n1b  # edges x edges
+    dim_C1 = n1a * m1b + m1a * n1b  # (E1 x V2) ⊕ (V1 x E2)
+    dim_C0 = m1a * m1b  # V1 x V2
+
+    d2 = np.zeros((dim_C1, dim_C2), dtype=np.int8)
+    d1 = np.zeros((dim_C0, dim_C1), dtype=np.int8)
+
+    # Bases and index maps
+    C2_basis: List[Tuple[str, int, int]] = []
+    C1_basis: List[Tuple[str, int, int]] = []
+    C0_basis: List[Tuple[str, int, int]] = []
+    idx_C2: Dict[Tuple[str, int, int], int] = {}
+    idx_C1: Dict[Tuple[str, int, int], int] = {}
+    idx_C0: Dict[Tuple[str, int, int], int] = {}
+
+    # C2: edgesA x edgesB
+    for i in range(n1a):
+        for j in range(n1b):
+            key = ("E1E2", i, j)
+            idx = len(C2_basis)
+            C2_basis.append(key)
+            idx_C2[key] = idx
+
+    # C1 part1: edgesA x vertsB
+    for i in range(n1a):
+        for u in range(m1b):
+            key = ("E1V2", i, u)
+            idx = len(C1_basis)
+            C1_basis.append(key)
+            idx_C1[key] = idx
+
+    # C1 part2: vertsA x edgesB
+    for v in range(m1a):
+        for j in range(n1b):
+            key = ("V1E2", v, j)
+            idx = len(C1_basis)
+            C1_basis.append(key)
+            idx_C1[key] = idx
+
+    # C0: vertsA x vertsB
+    for v in range(m1a):
+        for u in range(m1b):
+            key = ("V1V2", v, u)
+            idx = len(C0_basis)
+            C0_basis.append(key)
+            idx_C0[key] = idx
+
+    # Fill d2: D2 -> D1
+    for i in range(n1a):
+        for j in range(n1b):
+            col = idx_C2[("E1E2", i, j)]
+
+            # Term: eA_i ⊗ ∂b(eB_j)
+            for u in range(m1b):
+                if H2[u, j] & 1:
+                    row = idx_C1[("E1V2", i, u)]
+                    d2[row, col] ^= 1
+
+            # Term: ∂a(eA_i) ⊗ eB_j
+            for v in range(m1a):
+                if H1[v, i] & 1:
+                    row = idx_C1[("V1E2", v, j)]
+                    d2[row, col] ^= 1
+
+    # Fill d1: D1 -> D0
+
+    # Part1: E1V2
+    for i in range(n1a):
+        for u in range(m1b):
+            col = idx_C1[("E1V2", i, u)]
+            # ∂1(eA_i ⊗ vB_u) = ∂a(eA_i) ⊗ vB_u
+            for v in range(m1a):
+                if H1[v, i] & 1:
+                    row = idx_C0[("V1V2", v, u)]
+                    d1[row, col] ^= 1
+
+    # Part2: V1E2
+    for v in range(m1a):
+        for j in range(n1b):
+            col = idx_C1[("V1E2", v, j)]
+            # ∂1(vA_v ⊗ eB_j) = vA_v ⊗ ∂b(eB_j)
+            for u in range(m1b):
+                if H2[u, j] & 1:
+                    row = idx_C0[("V1V2", v, u)]
+                    d1[row, col] ^= 1
+
+    return ChainComplex(
+        dim_C2=dim_C2,
+        dim_C1=dim_C1,
+        dim_C0=dim_C0,
+        d2=d2,
+        d1=d1,
+        basis_C2=C2_basis,
+        basis_C1=C1_basis,
+        basis_C0=C0_basis,
+        name=f"HGP({A.name},{B.name})",
+    )
+
+
+# ============================================================
 #  Tokenizer
 # ============================================================
 
@@ -492,17 +549,7 @@ class Token:
     value: str
 
 
-KEYWORDS = {
-    "code",
-    "as",
-    "ChainComplex",
-    "over",
-    "Z2",
-    "cells",
-    "boundary",
-    "Int",
-    "Fin",
-}
+KEYWORDS = {"code", "as", "ChainComplex", "over", "Z2", "cells", "boundary", "Int", "Fin"}
 
 
 def tokenize(src: str) -> List[Token]:
@@ -603,10 +650,31 @@ class Parser:
             raise ValueError(f"Expected identifier, got {tok}")
         return tok.value
 
-    # ------------- top-level -------------
+    # ------------- module level -------------
 
-    def parse_program(self) -> CodeDef:
-        self.expect_keyword("code")
+    def parse_module(self) -> List[CodeLike]:
+        """
+        Parse a module with one or more 'code ...' definitions.
+        """
+        codes: List[CodeLike] = []
+        while self.peek() is not None:
+            self.expect_keyword("code")
+            codes.append(self.parse_single_code())
+        return codes
+
+    # ------------- single code definition -------------
+
+    def parse_single_code(self) -> CodeLike:
+        """
+        Parse either:
+
+          code X(d: Int) as ChainComplex over Z2 { ... }
+
+        or
+
+          code Y(d: Int) as ChainComplex over Z2 =
+            hypergraph_product(A(...), B(...));
+        """
         name = self.expect_ident()
 
         # parameter list
@@ -623,43 +691,80 @@ class Parser:
         self.expect_keyword("ChainComplex")
         self.expect_keyword("over")
         self.expect_keyword("Z2")
-        self.expect_symbol("{")
 
-        # cells block
-        self.expect_keyword("cells")
-        self.expect_symbol("{")
-        cell_families: List[CellFamilyDecl] = []
-        while True:
-            tok = self.peek()
-            if tok is None:
-                raise ValueError("Unexpected EOF inside cells block")
-            if tok.kind == "SYMBOL" and tok.value == "}":
-                self.advance()
-                break
-            cell_families.append(self.parse_cell_decl())
+        # Decide between primitive and hypergraph_product form
+        tok = self.peek()
+        if tok is None:
+            raise ValueError("Unexpected EOF after 'over Z2'")
 
-        # boundary block
-        self.expect_keyword("boundary")
-        self.expect_symbol("{")
-        boundary_rules: List[BoundaryRule] = []
-        while True:
-            tok = self.peek()
-            if tok is None:
-                raise ValueError("Unexpected EOF inside boundary block")
-            if tok.kind == "SYMBOL" and tok.value == "}":
-                self.advance()
-                break
-            boundary_rules.append(self.parse_boundary_rule())
+        if tok.kind == "SYMBOL" and tok.value == "{":
+            # Primitive form: cells + boundary
+            self.advance()  # consume '{'
 
-        # closing brace of code block
-        self.expect_symbol("}")
+            # cells block
+            self.expect_keyword("cells")
+            self.expect_symbol("{")
+            cell_families: List[CellFamilyDecl] = []
+            while True:
+                tok2 = self.peek()
+                if tok2 is None:
+                    raise ValueError("Unexpected EOF inside cells block")
+                if tok2.kind == "SYMBOL" and tok2.value == "}":
+                    self.advance()
+                    break
+                cell_families.append(self.parse_cell_decl())
 
-        return CodeDef(
-            name=name,
-            param_names=param_names,
-            cell_families=cell_families,
-            boundary_rules=boundary_rules,
-        )
+            # boundary block
+            self.expect_keyword("boundary")
+            self.expect_symbol("{")
+            boundary_rules: List[BoundaryRule] = []
+            while True:
+                tok2 = self.peek()
+                if tok2 is None:
+                    raise ValueError("Unexpected EOF inside boundary block")
+                if tok2.kind == "SYMBOL" and tok2.value == "}":
+                    self.advance()
+                    break
+                boundary_rules.append(self.parse_boundary_rule())
+
+            # closing brace of code block
+            self.expect_symbol("}")
+
+            return CodeDef(
+                name=name,
+                param_names=param_names,
+                cell_families=cell_families,
+                boundary_rules=boundary_rules,
+            )
+
+        elif tok.kind == "SYMBOL" and tok.value == "=":
+            # Combinator form: hypergraph_product(...)
+            self.advance()  # consume '='
+            # hypergraph_product
+            func_tok = self.advance()
+            if func_tok.kind != "IDENT" or func_tok.value != "hypergraph_product":
+                raise ValueError(
+                    f"Expected 'hypergraph_product', got {func_tok}"
+                )
+            self.expect_symbol("(")
+            left = self.parse_code_call()
+            self.expect_symbol(",")
+            right = self.parse_code_call()
+            self.expect_symbol(")")
+            self.expect_symbol(";")
+
+            return HypergraphProductDef(
+                name=name,
+                param_names=param_names,
+                left=left,
+                right=right,
+            )
+
+        else:
+            raise ValueError(
+                f"Unexpected token after 'over Z2': {tok}. "
+                "Expected '{{' or '='."
+            )
 
     def parse_param(self) -> str:
         name = self.expect_ident()
@@ -751,6 +856,22 @@ class Parser:
         self.expect_symbol("]")
         return CellRefExpr(name=name, index_exprs=exprs)
 
+    # ------------- code calls for combinators -------------
+
+    def parse_code_call(self) -> CodeCall:
+        """
+        Parse a code call, e.g. repetition(d) or repetition(d-1).
+        """
+        name = self.expect_ident()
+        self.expect_symbol("(")
+        args: List[Expr] = []
+        if not self.match_symbol(")"):
+            args.append(self.parse_expr())
+            while self.match_symbol(","):
+                args.append(self.parse_expr())
+            self.expect_symbol(")")
+        return CodeCall(name=name, arg_exprs=args)
+
     # ------------- expressions -------------
 
     # expr -> term (('+'|'-') term)*
@@ -801,27 +922,85 @@ class Parser:
 
 
 # ============================================================
-#  Example source program (toric square lattice)
+#  High-level compilation dispatcher
+# ============================================================
+
+def compile_code(
+    code_env: Dict[str, CodeLike],
+    code_name: str,
+    param_values: Dict[str, int],
+) -> ChainComplex:
+    """
+    Dispatch compilation based on whether the code is primitive (CodeDef)
+    or derived via hypergraph_product (HypergraphProductDef).
+    """
+    if code_name not in code_env:
+        raise ValueError(f"Unknown code {code_name!r}")
+
+    code = code_env[code_name]
+
+    if isinstance(code, CodeDef):
+        # Primitive chain complex
+        return compile_chain_complex(code, param_values)
+
+    if isinstance(code, HypergraphProductDef):
+        # Derived via hypergraph_product
+        # 1. Ensure parameters are provided
+        env_params = dict(param_values)
+        for p in code.param_names:
+            if p not in env_params:
+                raise ValueError(
+                    f"Missing parameter {p!r} for derived code {code.name!r}"
+                )
+
+        # 2. Compile left and right args
+        def compile_call(call: CodeCall) -> ChainComplex:
+            if call.name not in code_env:
+                raise ValueError(
+                    f"Unknown callee {call.name!r} in hypergraph_product"
+                )
+            callee = code_env[call.name]
+            if not isinstance(callee, CodeDef):
+                # For now, restrict to primitive classical codes as inputs
+                raise ValueError(
+                    "hypergraph_product currently only supports primitive codes as inputs"
+                )
+            if len(call.arg_exprs) != len(callee.param_names):
+                raise ValueError(
+                    f"Arity mismatch calling {call.name!r}: "
+                    f"expected {len(callee.param_names)} args, "
+                    f"got {len(call.arg_exprs)}"
+                )
+            child_params: Dict[str, int] = {}
+            for p_name, arg_expr in zip(callee.param_names, call.arg_exprs):
+                child_params[p_name] = eval_expr(arg_expr, env_params)
+            return compile_chain_complex(callee, child_params)
+
+        left_chain = compile_call(code.left)
+        right_chain = compile_call(code.right)
+        return hypergraph_product(left_chain, right_chain)
+
+    raise TypeError(f"Unsupported code definition type: {type(code)}")
+
+
+# ============================================================
+#  Example QECType program with repetition + hypergraph_product
 # ============================================================
 
 SOURCE = r"""
-code toric_square_lattice(d: Int) as ChainComplex over Z2 {
+code repetition(d: Int) as ChainComplex over Z2 {
   cells {
-    faces  F[x: Fin d, y: Fin d];
-    edgesx Ex[x: Fin d, y: Fin d];
-    edgesy Ey[x: Fin d, y: Fin d];
-    verts  V[x: Fin d, y: Fin d];
+    edges E[i: Fin(d-1)];
+    verts V[i: Fin d];
   }
 
   boundary {
-    d2(F[x,y]) =
-      Ex[x,y] + Ex[x+1,y] +
-      Ey[x,y] + Ey[x,y+1];
-
-    d1(Ex[x,y]) = V[x,y] + V[x,y+1];
-    d1(Ey[x,y]) = V[x,y] + V[x+1,y];
+    d1(E[i]) = V[i] + V[i+1];
   }
 }
+
+code rep_hgp(d: Int) as ChainComplex over Z2 =
+  hypergraph_product(repetition(d), repetition(d));
 """
 
 
@@ -831,43 +1010,38 @@ def pretty_print_matrix(M, name="M"):
 
 
 def main():
-    src = SOURCE
-
-    tokens = tokenize(src)
+    tokens = tokenize(SOURCE)
     parser = Parser(tokens)
-    code = parser.parse_program()
+    code_list = parser.parse_module()
 
-    print("Parsed code:", code.name, "params", code.param_names)
+    # Build environment of code definitions
+    code_env: Dict[str, CodeLike] = {c.name: c for c in code_list}
 
-    d = 5  # toric patch size
-    chain = compile_chain_complex(code, {"d": d})
-    print(chain)
+    print("Parsed codes:", list(code_env.keys()))
 
-    Hx, Hz, comm = css_from_chain(chain)
+    # Compile repetition(d_rep)
+    d_rep = 5
+    rep_chain = compile_code(code_env, "repetition", {"d": d_rep})
+    print("\nRepetition chain:", rep_chain)
 
-    print(f"Number of qubits (edges): {chain.dim_C1}")
-    print(f"Number of X checks (faces): {Hx.shape[0]}")
-    print(f"Number of Z checks (vertices): {Hz.shape[0]}")
+    # Compile hypergraph product rep_hgp(d_rep) = HGP(repetition(d), repetition(d))
+    hgp_chain = compile_code(code_env, "rep_hgp", {"d": d_rep})
+    print("Hypergraph product chain:", hgp_chain)
 
-    pretty_print_matrix(Hx, name="Hx (X stabilizers from faces)")
-    pretty_print_matrix(Hz, name="Hz (Z stabilizers from vertices)")
+    Hx_hgp, Hz_hgp, comm_hgp = css_from_chain(hgp_chain)
+    print(f"Number of qubits (HGP):   {hgp_chain.dim_C1}")
+    print(f"Number of X checks (HGP): {Hx_hgp.shape[0]}")
+    print(f"Number of Z checks (HGP): {Hz_hgp.shape[0]}")
 
-    if np.any(comm):
-        print("\n[ERROR] CSS commutation violated: Hz * Hx^T != 0 over F2")
-        print("Non-zero entries in commutator matrix:")
-        print(comm)
+    if np.any(comm_hgp):
+        print("[ERROR] HGP CSS commutation violated")
+        pretty_print_matrix(comm_hgp, name="Hz * Hx^T (HGP)")
     else:
-        print("\n[OK] CSS commutation holds: Hz * Hx^T = 0 over F2")
+        print("[OK] HGP CSS commutation holds")
 
-    # Export to stabilizer IR (for toric code distance = d)
-    ir_str = chain_to_stabilizer_ir(
-        chain,
-        code_distance=d,               # for toric code, distance = d
-        code_type="ToricSquareLattice",
-        reg_name="q2",
-    )
-    print("\nStabilizer IR representation:\n")
-    print(ir_str)
+    if d_rep <= 5:
+        pretty_print_matrix(Hx_hgp, name="Hx (HGP)")
+        pretty_print_matrix(Hz_hgp, name="Hz (HGP)")
 
 
 if __name__ == "__main__":
